@@ -433,13 +433,112 @@
 <body>
     <div id="root"></div>
 
-    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- React 18 in Development Mode for better error messages -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
 
     <script type="text/babel">
         const { useState, useEffect } = React;
+
+        // ==================== AUTH & STORAGE MANAGER ====================
+        const AuthManager = {
+            // Storage keys
+            KEYS: {
+                ACCESS_TOKEN: 'safestep_access_token',
+                REFRESH_TOKEN: 'safestep_refresh_token',
+                USER_DATA: 'safestep_user_data',
+                TOKEN_EXPIRY: 'safestep_token_expiry'
+            },
+
+            // Save tokens
+            saveTokens(accessToken, refreshToken) {
+                localStorage.setItem(this.KEYS.ACCESS_TOKEN, accessToken);
+                localStorage.setItem(this.KEYS.REFRESH_TOKEN, refreshToken);
+                
+                // Calculate expiry (15 minutes for access token)
+                const expiry = Date.now() + (15 * 60 * 1000);
+                localStorage.setItem(this.KEYS.TOKEN_EXPIRY, expiry.toString());
+            },
+
+            // Save user data
+            saveUserData(userData) {
+                localStorage.setItem(this.KEYS.USER_DATA, JSON.stringify(userData));
+            },
+
+            // Get access token
+            getAccessToken() {
+                return localStorage.getItem(this.KEYS.ACCESS_TOKEN);
+            },
+
+            // Get refresh token
+            getRefreshToken() {
+                return localStorage.getItem(this.KEYS.REFRESH_TOKEN);
+            },
+
+            // Get user data
+            getUserData() {
+                const data = localStorage.getItem(this.KEYS.USER_DATA);
+                return data ? JSON.parse(data) : null;
+            },
+
+            // Check if token is expired
+            isTokenExpired() {
+                const expiry = localStorage.getItem(this.KEYS.TOKEN_EXPIRY);
+                if (!expiry) return true;
+                return Date.now() > parseInt(expiry);
+            },
+
+            // Check if user is authenticated
+            isAuthenticated() {
+                const token = this.getAccessToken();
+                return token && !this.isTokenExpired();
+            },
+
+            // Clear all auth data
+            clearAuth() {
+                localStorage.removeItem(this.KEYS.ACCESS_TOKEN);
+                localStorage.removeItem(this.KEYS.REFRESH_TOKEN);
+                localStorage.removeItem(this.KEYS.USER_DATA);
+                localStorage.removeItem(this.KEYS.TOKEN_EXPIRY);
+            },
+
+            // Refresh access token
+            async refreshAccessToken() {
+                const refreshToken = this.getRefreshToken();
+                if (!refreshToken) {
+                    throw new Error('No refresh token available');
+                }
+
+                try {
+                    const response = await fetch(`${API_CONFIG.BASE_URL}/auth/refresh`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ refreshToken })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error('Failed to refresh token');
+                    }
+
+                    const data = await response.json();
+                    if (data.success && data.data.accessToken) {
+                        // Save new access token
+                        const expiry = Date.now() + (15 * 60 * 1000);
+                        localStorage.setItem(this.KEYS.ACCESS_TOKEN, data.data.accessToken);
+                        localStorage.setItem(this.KEYS.TOKEN_EXPIRY, expiry.toString());
+                        return data.data.accessToken;
+                    }
+
+                    throw new Error('Invalid refresh response');
+                } catch (error) {
+                    console.error('Token refresh failed:', error);
+                    this.clearAuth();
+                    throw error;
+                }
+            }
+        };
 
         // ==================== API CLIENT ====================
         const API_CONFIG = {
@@ -459,6 +558,15 @@
 
             wsConnection.onopen = () => {
                 console.log('✅ Connected to SafeStep backend');
+                
+                // Authenticate WebSocket with JWT token
+                const token = AuthManager.getAccessToken();
+                if (token) {
+                    wsConnection.send(JSON.stringify({
+                        type: 'auth',
+                        token: token
+                    }));
+                }
             };
 
             wsConnection.onmessage = (event) => {
@@ -487,16 +595,69 @@
         async function apiRequest(endpoint, options = {}) {
             try {
                 const url = `${API_CONFIG.BASE_URL}${endpoint}`;
+                
+                // Get auth token
+                let token = AuthManager.getAccessToken();
+                
+                // Check if token is expired and refresh if needed
+                if (AuthManager.isTokenExpired() && AuthManager.getRefreshToken()) {
+                    try {
+                        token = await AuthManager.refreshAccessToken();
+                    } catch (error) {
+                        // Refresh failed, user needs to login again
+                        window.location.reload();
+                        throw new Error('Session expired. Please login again.');
+                    }
+                }
+                
                 const response = await fetch(url, {
                     ...options,
                     headers: {
                         'Content-Type': 'application/json',
+                        ...(token && { 'Authorization': `Bearer ${token}` }),
                         ...options.headers
                     }
                 });
 
+                // Handle 401 Unauthorized
+                if (response.status === 401) {
+                    // Try to refresh token once
+                    if (AuthManager.getRefreshToken()) {
+                        try {
+                            token = await AuthManager.refreshAccessToken();
+                            // Retry request with new token
+                            const retryResponse = await fetch(url, {
+                                ...options,
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${token}`,
+                                    ...options.headers
+                                }
+                            });
+                            
+                            if (!retryResponse.ok) {
+                                throw new Error(`API Error: ${retryResponse.statusText}`);
+                            }
+                            
+                            const data = await retryResponse.json();
+                            return data;
+                        } catch (refreshError) {
+                            // Refresh failed, clear auth and reload
+                            AuthManager.clearAuth();
+                            window.location.reload();
+                            throw new Error('Session expired. Please login again.');
+                        }
+                    } else {
+                        // No refresh token, clear auth and reload
+                        AuthManager.clearAuth();
+                        window.location.reload();
+                        throw new Error('Authentication required');
+                    }
+                }
+
                 if (!response.ok) {
-                    throw new Error(`API Error: ${response.statusText}`);
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.error || `API Error: ${response.statusText}`);
                 }
 
                 const data = await response.json();
@@ -508,31 +669,284 @@
         }
 
         const SafeStepAPI = {
+            // Authentication
+            async login(email, password) {
+                try {
+                    const response = await fetch(`${API_CONFIG.BASE_URL}/auth/login`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ email, password })
+                    });
+
+                    const data = await response.json();
+                    
+                    if (!response.ok) {
+                        throw new Error(data.error || 'Login failed');
+                    }
+
+                    if (data.success && data.data) {
+                        // Save tokens and user data
+                        AuthManager.saveTokens(data.data.accessToken, data.data.refreshToken);
+                        AuthManager.saveUserData(data.data.user);
+                        return { success: true, user: data.data.user };
+                    }
+
+                    throw new Error('Invalid login response');
+                } catch (error) {
+                    console.error('Login error:', error);
+                    throw error;
+                }
+            },
+
+            async register(email, password, name, additionalData = {}) {
+                try {
+                    const response = await fetch(`${API_CONFIG.BASE_URL}/auth/register`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ 
+                            email, 
+                            password, 
+                            name,
+                            ...additionalData
+                        })
+                    });
+
+                    const data = await response.json();
+                    
+                    if (!response.ok) {
+                        throw new Error(data.error || data.errors?.[0]?.message || 'Registration failed');
+                    }
+
+                    if (data.success && data.data) {
+                        // Save tokens and user data
+                        AuthManager.saveTokens(data.data.accessToken, data.data.refreshToken);
+                        AuthManager.saveUserData(data.data.user);
+                        return { success: true, user: data.data.user };
+                    }
+
+                    throw new Error('Invalid registration response');
+                } catch (error) {
+                    console.error('Registration error:', error);
+                    throw error;
+                }
+            },
+
+            async logout() {
+                try {
+                    const refreshToken = AuthManager.getRefreshToken();
+                    if (refreshToken) {
+                        await apiRequest('/auth/logout', {
+                            method: 'POST',
+                            body: JSON.stringify({ refreshToken })
+                        });
+                    }
+                } catch (error) {
+                    console.error('Logout error:', error);
+                } finally {
+                    AuthManager.clearAuth();
+                    if (wsConnection) {
+                        wsConnection.close();
+                    }
+                }
+            },
+
+            async verifyToken() {
+                try {
+                    const response = await apiRequest('/auth/verify');
+                    if (response.success && response.data.user) {
+                        AuthManager.saveUserData(response.data.user);
+                        return { success: true, user: response.data.user };
+                    }
+                    return { success: false };
+                } catch (error) {
+                    console.error('Token verification failed:', error);
+                    return { success: false };
+                }
+            },
+
+            // WebSocket
             connect: initWebSocket,
             on: (eventType, callback) => {
                 wsCallbacks[eventType] = callback;
             },
+            
+            // Data endpoints
             getDashboard: () => apiRequest('/dashboard'),
+            getUser: () => apiRequest('/users/me'),
+            updateUser: (data) => apiRequest('/users/me', { 
+                method: 'PUT', 
+                body: JSON.stringify(data) 
+            }),
+            getDeviceStatus: () => apiRequest('/device/status'),
+            getActivity: () => apiRequest('/activity'),
+            getHealth: () => apiRequest('/health'),
+            getFallRisk: () => apiRequest('/fallrisk'),
+            getAlerts: () => apiRequest('/alerts'),
             activateSOS: () => apiRequest('/emergency/sos', { method: 'POST' }),
         };
 
         // ==================== COMPONENTS ====================
 
-        // Icons
-        const Icon = ({ name, size = 24, color = "currentColor", ...props }) => {
-            useEffect(() => {
-                lucide.createIcons();
+        // Icons - Robust approach using refs to prevent React/Lucide conflicts
+        const Icon = ({ name, size = 24, color = "currentColor", className = "", ...props }) => {
+            const iconRef = React.useRef(null);
+            const [iconSvg, setIconSvg] = React.useState(null);
+
+            React.useEffect(() => {
+                // Create a temporary container outside of React's control
+                const tempContainer = document.createElement('div');
+                tempContainer.innerHTML = `<i data-lucide="${name}"></i>`;
+                
+                try {
+                    // Let Lucide convert it to SVG
+                    if (typeof lucide !== 'undefined' && lucide.createIcons) {
+                        lucide.createIcons({ nameAttr: 'data-lucide', nodes: [tempContainer.firstChild] });
+                        
+                        // Extract the SVG
+                        const svg = tempContainer.querySelector('svg');
+                        if (svg) {
+                            // Clone and customize the SVG
+                            const clonedSvg = svg.cloneNode(true);
+                            clonedSvg.setAttribute('width', size);
+                            clonedSvg.setAttribute('height', size);
+                            clonedSvg.setAttribute('stroke', color);
+                            clonedSvg.style.display = 'inline-block';
+                            clonedSvg.style.verticalAlign = 'middle';
+                            
+                            // Store the SVG HTML
+                            setIconSvg(clonedSvg.outerHTML);
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Icon creation warning:', e);
+                }
+                
+                // Cleanup
+                return () => {
+                    tempContainer.remove();
+                };
+            }, [name, size, color]);
+
+            // Render using dangerouslySetInnerHTML to avoid React trying to manage the SVG
+            return React.createElement('span', {
+                ref: iconRef,
+                className: className,
+                style: {
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    width: size,
+                    height: size
+                },
+                dangerouslySetInnerHTML: iconSvg ? { __html: iconSvg } : undefined,
+                ...props
             });
-            return React.createElement('i', { 
-                'data-lucide': name, 
-                style: { width: size, height: size, color },
-                ...props 
-            });
+        };
+
+        // No global initialization needed anymore!
+        const initLucideIcons = () => {
+            console.log('✅ Lucide icons are now initialized per-component (no global init needed)');
         };
 
         // Login Screen
         const LoginScreen = ({ onLogin }) => {
             const [isLogin, setIsLogin] = useState(true);
+            const [formData, setFormData] = useState({
+                email: '',
+                password: '',
+                name: ''
+            });
+            const [loading, setLoading] = useState(false);
+            const [error, setError] = useState('');
+            const [showPassword, setShowPassword] = useState(false);
+
+            // Demo credentials hint
+            const [showHint, setShowHint] = useState(false);
+
+            const handleInputChange = (e) => {
+                setFormData({
+                    ...formData,
+                    [e.target.name]: e.target.value
+                });
+                setError(''); // Clear error on input change
+            };
+
+            const validateForm = () => {
+                if (!formData.email || !formData.password) {
+                    setError('Please fill in all required fields');
+                    return false;
+                }
+
+                // Email validation
+                const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+                if (!emailRegex.test(formData.email)) {
+                    setError('Please enter a valid email address');
+                    return false;
+                }
+
+                // Password validation
+                if (formData.password.length < 8) {
+                    setError('Password must be at least 8 characters');
+                    return false;
+                }
+
+                if (!isLogin && !formData.name) {
+                    setError('Please enter your full name');
+                    return false;
+                }
+
+                return true;
+            };
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                
+                if (!validateForm()) {
+                    return;
+                }
+
+                setLoading(true);
+                setError('');
+
+                try {
+                    let response;
+                    
+                    if (isLogin) {
+                        // Login
+                        response = await SafeStepAPI.login(
+                            formData.email,
+                            formData.password
+                        );
+                    } else {
+                        // Register
+                        response = await SafeStepAPI.register(
+                            formData.email,
+                            formData.password,
+                            formData.name
+                        );
+                    }
+
+                    if (response.success) {
+                        console.log('✅ Authentication successful:', response.user);
+                        onLogin(response.user);
+                    }
+                } catch (error) {
+                    console.error('Authentication error:', error);
+                    setError(error.message || 'Authentication failed. Please try again.');
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const fillDemoCredentials = () => {
+                setFormData({
+                    email: 'marie.joubert@email.com',
+                    password: 'Password123!',
+                    name: ''
+                });
+                setIsLogin(true);
+                setError('');
+            };
 
             return (
                 <div className="app-container flex items-center justify-center p-6">
@@ -544,43 +958,166 @@
                             <h1 className="text-4xl font-bold mb-2 bg-gradient-to-r from-blue-600 to-blue-400 bg-clip-text text-transparent">
                                 SafeStep
                             </h1>
-                            <p className="text-slate-500 text-sm">Walk with confidence</p>
+                            <p className="text-slate-500 text-sm">Walk with confidence • Secure Authentication</p>
                         </div>
 
                         <div className="glass-effect rounded-2xl p-8 shadow-xl">
+                            {/* Tab Switcher */}
                             <div className="flex gap-2 mb-8 p-1 bg-slate-100 rounded-xl">
                                 <button 
                                     className={`flex-1 py-2.5 rounded-lg font-semibold transition-all ${isLogin ? 'bg-white shadow-sm text-blue-600' : 'text-slate-500'}`}
-                                    onClick={() => setIsLogin(true)}
+                                    onClick={() => {
+                                        setIsLogin(true);
+                                        setError('');
+                                    }}
+                                    disabled={loading}
                                 >
                                     Login
                                 </button>
                                 <button 
                                     className={`flex-1 py-2.5 rounded-lg font-semibold transition-all ${!isLogin ? 'bg-white shadow-sm text-blue-600' : 'text-slate-500'}`}
-                                    onClick={() => setIsLogin(false)}
+                                    onClick={() => {
+                                        setIsLogin(false);
+                                        setError('');
+                                    }}
+                                    disabled={loading}
                                 >
                                     Sign Up
                                 </button>
                             </div>
 
-                            <div className="space-y-4">
+                            {/* Error Message */}
+                            {error && (
+                                <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2">
+                                    <Icon name="alert-circle" size={18} color="#EF4444" />
+                                    <span className="text-sm text-red-600 flex-1">{error}</span>
+                                </div>
+                            )}
+
+                            {/* Form */}
+                            <form onSubmit={handleSubmit} className="space-y-4">
                                 {!isLogin && (
-                                    <input type="text" placeholder="Full Name" />
+                                    <div>
+                                        <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                                            Full Name
+                                        </label>
+                                        <input 
+                                            type="text" 
+                                            name="name"
+                                            placeholder="John Doe" 
+                                            value={formData.name}
+                                            onChange={handleInputChange}
+                                            disabled={loading}
+                                            className="w-full px-4 py-3 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+                                        />
+                                    </div>
                                 )}
-                                <input type="email" placeholder="Email" />
-                                <input type="password" placeholder="Password" />
                                 
-                                <button className="btn btn-primary w-full mt-6" onClick={onLogin}>
-                                    <span className="relative z-10">
-                                        {isLogin ? 'Sign In' : 'Create Account'}
-                                    </span>
-                                    <Icon name="arrow-right" size={20} />
+                                <div>
+                                    <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                                        Email Address
+                                    </label>
+                                    <input 
+                                        type="email" 
+                                        name="email"
+                                        placeholder="your@email.com" 
+                                        value={formData.email}
+                                        onChange={handleInputChange}
+                                        disabled={loading}
+                                        className="w-full px-4 py-3 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+                                        autoComplete="email"
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                                        Password
+                                    </label>
+                                    <div className="relative">
+                                        <input 
+                                            type={showPassword ? "text" : "password"} 
+                                            name="password"
+                                            placeholder="••••••••" 
+                                            value={formData.password}
+                                            onChange={handleInputChange}
+                                            disabled={loading}
+                                            className="w-full px-4 py-3 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 pr-12"
+                                            autoComplete={isLogin ? "current-password" : "new-password"}
+                                        />
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowPassword(!showPassword)}
+                                            className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                                            disabled={loading}
+                                        >
+                                            <Icon name={showPassword ? "eye-off" : "eye"} size={20} />
+                                        </button>
+                                    </div>
+                                    {!isLogin && (
+                                        <p className="mt-1.5 text-xs text-slate-500">
+                                            Min. 8 characters, 1 uppercase, 1 lowercase, 1 number, 1 special char
+                                        </p>
+                                    )}
+                                </div>
+                                
+                                <button 
+                                    type="submit"
+                                    className="btn btn-primary w-full mt-6 disabled:opacity-50 disabled:cursor-not-allowed" 
+                                    disabled={loading}
+                                >
+                                    {loading ? (
+                                        <span className="flex items-center justify-center gap-2">
+                                            <svg className="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                            </svg>
+                                            {isLogin ? 'Signing In...' : 'Creating Account...'}
+                                        </span>
+                                    ) : (
+                                        <>
+                                            <span className="relative z-10">
+                                                {isLogin ? 'Sign In' : 'Create Account'}
+                                            </span>
+                                            <Icon name="arrow-right" size={20} />
+                                        </>
+                                    )}
                                 </button>
-                            </div>
+                            </form>
+
+                            {/* Demo Credentials */}
+                            {isLogin && (
+                                <div className="mt-6 pt-6 border-t border-slate-200">
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowHint(!showHint)}
+                                        className="text-sm text-blue-600 hover:text-blue-700 font-medium flex items-center gap-1 mx-auto"
+                                    >
+                                        <Icon name="info" size={16} />
+                                        Demo Credentials
+                                    </button>
+                                    
+                                    {showHint && (
+                                        <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                                            <p className="text-xs text-blue-900 font-mono mb-2">
+                                                Email: marie.joubert@email.com<br/>
+                                                Password: Password123!
+                                            </p>
+                                            <button
+                                                type="button"
+                                                onClick={fillDemoCredentials}
+                                                className="text-xs text-blue-600 hover:text-blue-700 font-medium"
+                                                disabled={loading}
+                                            >
+                                                Fill Demo Credentials
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
                         </div>
 
                         <p className="text-center text-sm text-slate-400 mt-6">
-                            Version 2.1.0 • Secure & Confidential
+                            Version 3.0.0 • Secure JWT Authentication
                         </p>
                     </div>
                 </div>
@@ -588,7 +1125,7 @@
         };
 
         // Dashboard Screen
-        const DashboardScreen = () => {
+        const DashboardScreen = ({ currentUser }) => {
             const [dashboardData, setDashboardData] = useState(null);
             const [loading, setLoading] = useState(true);
 
@@ -640,9 +1177,9 @@
             }
 
             const { device, activity, location, health } = dashboardData;
-            const connected = device.connected;
-            const battery = device.battery;
-            const steps = activity.steps;
+            const connected = device?.connected ?? false;
+            const battery = device?.battery ?? 0;
+            const steps = activity?.steps ?? 0;
 
             return (
                 <div className="p-6 pb-24 animate-fade-in">
@@ -651,11 +1188,17 @@
                             <h2 className="text-2xl font-bold">Dashboard</h2>
                             <p className="text-sm text-slate-500 mono">{new Date().toLocaleString('fr-FR')}</p>
                         </div>
-                        <div className="flex items-center gap-2">
-                            <div className={`status-dot ${connected ? 'active' : ''}`} style={{ background: connected ? '#10B981' : '#EF4444' }}></div>
-                            <span className="text-sm font-semibold" style={{ color: connected ? '#10B981' : '#EF4444' }}>
-                                {connected ? 'Connected' : 'Disconnected'}
-                            </span>
+                        <div className="flex items-center gap-3">
+                            <div className="text-right">
+                                <p className="text-sm font-semibold text-slate-700">{currentUser?.name || 'Utilisateur'}</p>
+                                <p className="text-xs text-slate-400">{currentUser?.email || ''}</p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <div className={`status-dot ${connected ? 'active' : ''}`} style={{ background: connected ? '#10B981' : '#EF4444' }}></div>
+                                <span className="text-sm font-semibold" style={{ color: connected ? '#10B981' : '#EF4444' }}>
+                                    {connected ? 'Connected' : 'Disconnected'}
+                                </span>
+                            </div>
                         </div>
                     </div>
 
@@ -676,7 +1219,7 @@
                         </div>
                         <div className="absolute top-4 right-4 bg-white rounded-lg px-3 py-2 shadow-lg">
                             <p className="text-xs font-semibold text-slate-600">Current Location</p>
-                            <p className="text-xs text-slate-500 mono">{location.latitude.toFixed(4)}° N, {location.longitude.toFixed(4)}° E</p>
+                            <p className="text-xs text-slate-500 mono">{(location?.latitude ?? 48.8566).toFixed(4)}° N, {(location?.longitude ?? 2.3522).toFixed(4)}° E</p>
                         </div>
                     </div>
 
@@ -694,7 +1237,7 @@
                         </div>
                         <div className="metric-card text-center">
                             <Icon name="heart-pulse" size={28} color="#EF4444" className="mx-auto mb-2" />
-                            <p className="text-2xl font-bold">{Math.round(health.heartRate)}</p>
+                            <p className="text-2xl font-bold">{Math.round(health?.heartRate ?? 72)}</p>
                             <p className="text-xs text-slate-500 mt-1">BPM</p>
                         </div>
                     </div>
@@ -1219,16 +1762,88 @@
 
         // Weather & Environment Screen
         const WeatherScreen = () => {
+            const [weatherData, setWeatherData] = useState(null);
+            const [location, setLocation] = useState(null);
+            const [loading, setLoading] = useState(true);
+
+            useEffect(() => {
+                loadWeatherData();
+            }, []);
+
+            const loadWeatherData = async () => {
+                try {
+                    // Get user's location from dashboard data
+                    const response = await SafeStepAPI.getDashboard();
+                    if (response.data && response.data.location) {
+                        const { latitude, longitude } = response.data.location;
+                        setLocation({
+                            city: 'Votre position',
+                            latitude: latitude,
+                            longitude: longitude
+                        });
+                    } else {
+                        // Fallback to default location (Paris)
+                        setLocation({
+                            city: 'Paris',
+                            latitude: 48.8566,
+                            longitude: 2.3522
+                        });
+                    }
+                    
+                    // Simulated weather data (in a real app, you would call a weather API)
+                    setWeatherData({
+                        temperature: 18,
+                        condition: 'Sunny',
+                        wind: 12,
+                        humidity: 45,
+                        visibility: 'Good',
+                        uvIndex: 'Moderate'
+                    });
+                    setLoading(false);
+                } catch (error) {
+                    console.error('Error loading weather:', error);
+                    // Fallback data
+                    setLocation({
+                        city: 'Paris',
+                        latitude: 48.8566,
+                        longitude: 2.3522
+                    });
+                    setWeatherData({
+                        temperature: 18,
+                        condition: 'Sunny',
+                        wind: 12,
+                        humidity: 45,
+                        visibility: 'Good',
+                        uvIndex: 'Moderate'
+                    });
+                    setLoading(false);
+                }
+            };
+
+            if (loading) {
+                return (
+                    <div className="p-6 flex items-center justify-center h-screen">
+                        <div className="text-center">
+                            <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-blue-500 mx-auto mb-4"></div>
+                            <p className="text-slate-500">Chargement météo...</p>
+                        </div>
+                    </div>
+                );
+            }
+
             return (
                 <div className="p-6 pb-24 animate-fade-in">
-                    <h2 className="text-2xl font-bold mb-6">Weather Météo & Environnement Environment</h2>
+                    <h2 className="text-2xl font-bold mb-6">Météo & Environnement</h2>
 
                     <div className="metric-card mb-6 bg-gradient-to-br from-blue-400 to-blue-600 text-white">
                         <div className="flex items-center justify-between">
                             <div>
-                                <p className="text-sm opacity-90 mb-1">Now in Madrid</p>
-                                <p className="text-5xl font-bold mb-2">18°C</p>
-                                <p className="text-sm opacity-90">Sunny • Wind: 12 km/h</p>
+                                <p className="text-sm opacity-90 mb-1">Maintenant à {location?.city || 'Paris'}</p>
+                                <p className="text-xs opacity-75 mono mb-2">
+                                    {location?.latitude?.toFixed(4)}° N, {location?.longitude?.toFixed(4)}° E
+                                </p>
+                                <p className="text-5xl font-bold mb-2">{weatherData?.temperature || 18}°C</p>
+                                <p className="text-sm opacity-90">{weatherData?.condition || 'Sunny'} • Vent: {weatherData?.wind || 12} km/h</p>
                             </div>
                             <Icon name="sun" size={64} color="white" className="opacity-90" />
                         </div>
@@ -1237,21 +1852,21 @@
                     <div className="metric-card mb-6">
                         <h3 className="font-semibold mb-4 flex items-center gap-2">
                             <Icon name="alert-triangle" size={20} color="#F59E0B" />
-                            Environmental Alerts
+                            Alertes environnementales
                         </h3>
                         <div className="space-y-3">
                             <div className="p-3 bg-green-50 rounded-lg flex items-start gap-3">
                                 <Icon name="check-circle" size={20} color="#10B981" className="mt-0.5" />
                                 <div>
-                                    <p className="font-semibold text-sm text-green-800">Ideal Conditions</p>
-                                    <p className="text-xs text-green-600">Perfect for a walk</p>
+                                    <p className="font-semibold text-sm text-green-800">Conditions idéales</p>
+                                    <p className="text-xs text-green-600">Parfait pour une promenade</p>
                                 </div>
                             </div>
                             <div className="p-3 bg-amber-50 rounded-lg flex items-start gap-3">
                                 <Icon name="droplets" size={20} color="#F59E0B" className="mt-0.5" />
                                 <div>
-                                    <p className="font-semibold text-sm text-amber-800">Rain expected at 4 PM</p>
-                                    <p className="text-xs text-amber-600">Avoid going out after 3:30 PM</p>
+                                    <p className="font-semibold text-sm text-amber-800">Pluie prévue à 16h</p>
+                                    <p className="text-xs text-amber-600">Évitez de sortir après 15h30</p>
                                 </div>
                             </div>
                         </div>
@@ -1260,23 +1875,23 @@
                     <div className="grid grid-cols-2 gap-4 responsive-grid-4">
                         <div className="metric-card text-center">
                             <Icon name="thermometer" size={28} color="#EF4444" className="mx-auto mb-2" />
-                            <p className="text-sm text-slate-600 mb-1">Temperature</p>
-                            <p className="text-xl font-bold">Comfortable</p>
+                            <p className="text-sm text-slate-600 mb-1">Température</p>
+                            <p className="text-xl font-bold">Confortable</p>
                         </div>
                         <div className="metric-card text-center">
                             <Icon name="droplet" size={28} color="#0EA5E9" className="mx-auto mb-2" />
-                            <p className="text-sm text-slate-600 mb-1">Humidity</p>
-                            <p className="text-xl font-bold">45%</p>
+                            <p className="text-sm text-slate-600 mb-1">Humidité</p>
+                            <p className="text-xl font-bold">{weatherData?.humidity || 45}%</p>
                         </div>
                         <div className="metric-card text-center">
                             <Icon name="eye" size={28} color="#64748B" className="mx-auto mb-2" />
-                            <p className="text-sm text-slate-600 mb-1">Visibility</p>
-                            <p className="text-xl font-bold">Excellent</p>
+                            <p className="text-sm text-slate-600 mb-1">Visibilité</p>
+                            <p className="text-xl font-bold">{weatherData?.visibility || 'Bonne'}</p>
                         </div>
                         <div className="metric-card text-center">
                             <Icon name="sun" size={28} color="#F59E0B" className="mx-auto mb-2" />
-                            <p className="text-sm text-slate-600 mb-1">UV Index</p>
-                            <p className="text-xl font-bold">Modéré</p>
+                            <p className="text-sm text-slate-600 mb-1">Indice UV</p>
+                            <p className="text-xl font-bold">{weatherData?.uvIndex || 'Modéré'}</p>
                         </div>
                     </div>
                 </div>
@@ -1562,11 +2177,41 @@
         };
 
         // Settings Screen
-        const SettingsScreen = () => {
+        const SettingsScreen = ({ currentUser, onLogout }) => {
             const [notifications, setNotifications] = useState(true);
             const [vibration, setVibration] = useState(true);
             const [autoSOS, setAutoSOS] = useState(true);
             const [voiceCommands, setVoiceCommands] = useState(false);
+            const [isLoggingOut, setIsLoggingOut] = useState(false);
+
+            const handleLogoutClick = async () => {
+                if (window.confirm('Are you sure you want to sign out?')) {
+                    setIsLoggingOut(true);
+                    try {
+                        await onLogout();
+                    } catch (error) {
+                        console.error('Logout error:', error);
+                        alert('Failed to logout. Please try again.');
+                        setIsLoggingOut(false);
+                    }
+                }
+            };
+
+            // Extract user initials for avatar
+            const getInitials = (name) => {
+                if (!name) return 'U';
+                const parts = name.split(' ');
+                if (parts.length >= 2) {
+                    return (parts[0][0] + parts[1][0]).toUpperCase();
+                }
+                return name.substring(0, 2).toUpperCase();
+            };
+
+            const userInitials = getInitials(currentUser?.name);
+            const isVerified = currentUser?.emailVerified || false;
+
+            // Emergency contacts from user data
+            const emergencyContacts = currentUser?.emergencyContacts || [];
 
             return (
                 <div className="p-6 pb-24 animate-fade-in">
@@ -1576,11 +2221,29 @@
                     <div className="metric-card mb-6">
                         <div className="flex items-center gap-4">
                             <div className="w-16 h-16 bg-gradient-to-br from-blue-500 to-blue-600 rounded-2xl flex items-center justify-center text-white text-2xl font-bold">
-                                MJ
+                                {userInitials}
                             </div>
-                            <div>
-                                <h3 className="font-bold">Tueie Joubert</h3>
-                                <p className="text-sm text-slate-500">marie.joubert@email.com</p>
+                            <div className="flex-1">
+                                <h3 className="font-bold">{currentUser?.name || 'User'}</h3>
+                                <p className="text-sm text-slate-500">{currentUser?.email || 'email@example.com'}</p>
+                                <div className="flex items-center gap-2 mt-1">
+                                    {isVerified ? (
+                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-emerald-100 text-emerald-700 rounded-full text-xs font-medium">
+                                            <Icon name="check-circle" size={12} />
+                                            Verified
+                                        </span>
+                                    ) : (
+                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-100 text-amber-700 rounded-full text-xs font-medium">
+                                            <Icon name="alert-circle" size={12} />
+                                            Not Verified
+                                        </span>
+                                    )}
+                                    {currentUser?.role && (
+                                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full text-xs font-medium capitalize">
+                                            {currentUser.role}
+                                        </span>
+                                    )}
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1591,32 +2254,29 @@
                             <Icon name="users" size={20} color="#0EA5E9" />
                             Emergency Contacts
                         </h3>
-                        <div className="space-y-3">
-                            <div className="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
-                                <div className="flex items-center gap-3">
-                                    <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center">
-                                        <Icon name="user" size={18} color="#0EA5E9" />
+                        {emergencyContacts.length > 0 ? (
+                            <div className="space-y-3">
+                                {emergencyContacts.map((contact, index) => (
+                                    <div key={index} className="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
+                                        <div className="flex items-center gap-3">
+                                            <div className={`w-10 h-10 ${contact.isPrimary ? 'bg-blue-100' : 'bg-green-100'} rounded-full flex items-center justify-center`}>
+                                                <Icon name={contact.isPrimary ? 'star' : 'user'} size={18} color={contact.isPrimary ? '#0EA5E9' : '#10B981'} />
+                                            </div>
+                                            <div>
+                                                <p className="font-semibold text-sm">
+                                                    {contact.name}
+                                                    {contact.relationship && ` (${contact.relationship})`}
+                                                </p>
+                                                <p className="text-xs text-slate-500 mono">{contact.phoneNumber}</p>
+                                            </div>
+                                        </div>
+                                        <Icon name="chevron-right" size={20} color="#CBD5E1" />
                                     </div>
-                                    <div>
-                                        <p className="font-semibold text-sm">Dr. Laurent</p>
-                                        <p className="text-xs text-slate-500 mono">+33 6 12 34 56 78</p>
-                                    </div>
-                                </div>
-                                <Icon name="chevron-right" size={20} color="#CBD5E1" />
+                                ))}
                             </div>
-                            <div className="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
-                                <div className="flex items-center gap-3">
-                                    <div className="w-10 h-10 bg-green-100 rounded-full flex items-center justify-center">
-                                        <Icon name="heart" size={18} color="#10B981" />
-                                    </div>
-                                    <div>
-                                        <p className="font-semibold text-sm">Sophie (Daughter)</p>
-                                        <p className="text-xs text-slate-500 mono">+33 6 98 76 54 32</p>
-                                    </div>
-                                </div>
-                                <Icon name="chevron-right" size={20} color="#CBD5E1" />
-                            </div>
-                        </div>
+                        ) : (
+                            <p className="text-sm text-slate-500 text-center py-4">No emergency contacts added yet</p>
+                        )}
                         <button className="w-full mt-3 py-2.5 border-2 border-dashed border-slate-200 rounded-lg text-sm font-semibold text-slate-400 hover:border-blue-300 hover:text-blue-500 transition-all">
                             + Add Contact
                         </button>
@@ -1699,9 +2359,25 @@
                     </div>
 
                     {/* Logout */}
-                    <button className="w-full py-3.5 border-2 border-red-200 text-red-500 rounded-xl font-semibold hover:bg-red-50 transition-all flex items-center justify-center gap-2">
-                        <Icon name="log-out" size={20} />
-                        Sign Out
+                    <button 
+                        onClick={handleLogoutClick}
+                        disabled={isLoggingOut}
+                        className={`w-full py-3.5 border-2 border-red-200 text-red-500 rounded-xl font-semibold hover:bg-red-50 transition-all flex items-center justify-center gap-2 ${isLoggingOut ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    >
+                        {isLoggingOut ? (
+                            <>
+                                <svg className="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                                Signing Out...
+                            </>
+                        ) : (
+                            <>
+                                <Icon name="log-out" size={20} />
+                                Sign Out
+                            </>
+                        )}
                     </button>
                 </div>
             );
@@ -1710,19 +2386,100 @@
         // Main App
         const App = () => {
             const [isLoggedIn, setIsLoggedIn] = useState(false);
+            const [currentUser, setCurrentUser] = useState(null);
             const [currentScreen, setCurrentScreen] = useState('dashboard');
             const [menuOpen, setMenuOpen] = useState(false);
+            const [authLoading, setAuthLoading] = useState(true);
 
+            // Check authentication on mount
             useEffect(() => {
-                // Initialize WebSocket connection
-                SafeStepAPI.connect();
+                checkAuthentication();
+            }, []);
 
+            const checkAuthentication = async () => {
+                setAuthLoading(true);
+                
+                try {
+                    // Check if user has valid tokens
+                    if (AuthManager.isAuthenticated()) {
+                        // Verify token with backend
+                        const result = await SafeStepAPI.verifyToken();
+                        
+                        if (result.success && result.user) {
+                            setCurrentUser(result.user);
+                            setIsLoggedIn(true);
+                            console.log('✅ User authenticated:', result.user);
+                        } else {
+                            // Token invalid, clear auth
+                            AuthManager.clearAuth();
+                            setIsLoggedIn(false);
+                        }
+                    } else {
+                        // No valid token
+                        setIsLoggedIn(false);
+                    }
+                } catch (error) {
+                    console.error('Authentication check failed:', error);
+                    AuthManager.clearAuth();
+                    setIsLoggedIn(false);
+                } finally {
+                    setAuthLoading(false);
+                }
+            };
+
+            const handleLogin = (user) => {
+                setCurrentUser(user);
+                setIsLoggedIn(true);
+                
+                // Initialize WebSocket connection after login
+                SafeStepAPI.connect();
+                
                 // Listen for fall detection
                 SafeStepAPI.on('fall_detected', (data) => {
                     console.log('🚨 FALL DETECTED:', data);
                     alert(`⚠️ CHUTE DÉTECTÉE!\n\nLieu: ${data.location}\nSévérité: ${data.severity}\n\nLes contacts d'urgence ont été notifiés.`);
                 });
-            }, []);
+            };
+
+            const handleLogout = async () => {
+                try {
+                    await SafeStepAPI.logout();
+                    setIsLoggedIn(false);
+                    setCurrentUser(null);
+                    setCurrentScreen('dashboard');
+                    console.log('✅ User logged out');
+                } catch (error) {
+                    console.error('Logout error:', error);
+                }
+            };
+
+            // Show loading screen while checking auth
+            if (authLoading) {
+                return (
+                    <div className="app-container flex items-center justify-center min-h-screen">
+                        <div className="text-center">
+                            <div className="inline-flex items-center justify-center w-20 h-20 bg-gradient-to-br from-blue-500 to-blue-600 rounded-3xl mb-6 shadow-lg">
+                                <Icon name="footprints" size={40} color="white" />
+                            </div>
+                            <h1 className="text-3xl font-bold mb-4 bg-gradient-to-r from-blue-600 to-blue-400 bg-clip-text text-transparent">
+                                SafeStep
+                            </h1>
+                            <div className="flex items-center justify-center gap-2">
+                                <svg className="animate-spin h-6 w-6 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                                <span className="text-slate-600">Loading...</span>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            // Show login screen if not authenticated
+            if (!isLoggedIn) {
+                return <LoginScreen onLogin={handleLogin} />;
+            }
 
             const menuItems = [
                 { id: 'dashboard', label: 'Dashboard', icon: 'home', color: '#0EA5E9' },
@@ -1742,7 +2499,7 @@
 
             const renderScreen = () => {
                 switch(currentScreen) {
-                    case 'dashboard': return <DashboardScreen />;
+                    case 'dashboard': return <DashboardScreen currentUser={currentUser} />;
                     case 'health': return <HealthStatsScreen />;
                     case 'medication': return <MedicationScreen />;
                     case 'exercise': return <ExerciseScreen />;
@@ -1754,14 +2511,10 @@
                     case 'social': return <SocialScreen />;
                     case 'achievements': return <AchievementsScreen />;
                     case 'emergency': return <EmergencyScreen />;
-                    case 'settings': return <SettingsScreen />;
-                    default: return <DashboardScreen />;
+                    case 'settings': return <SettingsScreen currentUser={currentUser} onLogout={handleLogout} />;
+                    default: return <DashboardScreen currentUser={currentUser} />;
                 }
             };
-
-            if (!isLoggedIn) {
-                return <LoginScreen onLogin={() => setIsLoggedIn(true)} />;
-            }
 
             return (
                 <div className="app-container">
@@ -1782,10 +2535,10 @@
                             <div className="metric-card mb-6">
                                 <div className="flex items-center gap-3">
                                     <div className="w-12 h-12 bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl flex items-center justify-center text-white text-lg font-bold">
-                                        MJ
+                                        {currentUser?.name?.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2) || 'U'}
                                     </div>
                                     <div className="flex-1">
-                                        <p className="font-semibold text-sm">Tueie Joubert</p>
+                                        <p className="font-semibold text-sm">{currentUser?.name || 'Utilisateur'}</p>
                                         <p className="text-xs text-slate-500">Online</p>
                                     </div>
                                     <div className="w-3 h-3 bg-green-400 rounded-full"></div>
@@ -1927,7 +2680,46 @@
             );
         };
 
-        ReactDOM.render(<App />, document.getElementById('root'));
+        // Render with React 18 API
+        console.log('🚀 Initializing React app...');
+        console.log('React version:', React.version);
+        console.log('ReactDOM available:', typeof ReactDOM);
+        
+        try {
+            const rootElement = document.getElementById('root');
+            console.log('Root element found:', rootElement);
+            
+            if (!rootElement) {
+                throw new Error('Root element not found!');
+            }
+            
+            // Clear any existing content
+            rootElement.innerHTML = '';
+            
+            const root = ReactDOM.createRoot(rootElement);
+            console.log('✅ React root created');
+            
+            root.render(<App />);
+            console.log('✅ App rendered');
+            
+            // Initialize lucide icons after React renders
+            initLucideIcons();
+        } catch (error) {
+            console.error('❌ React initialization error:', error);
+            document.body.innerHTML = `
+                <div style="padding: 40px; text-align: center; font-family: sans-serif;">
+                    <h1 style="color: #EF4444;">⚠️ Erreur de Chargement</h1>
+                    <p style="color: #64748B; margin: 20px 0;">${error.message}</p>
+                    <button onclick="location.reload()" style="padding: 12px 24px; background: #0EA5E9; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px;">
+                        🔄 Recharger la Page
+                    </button>
+                    <div style="margin-top: 20px; padding: 20px; background: #F1F5F9; border-radius: 8px; text-align: left;">
+                        <strong>Détails techniques :</strong><br>
+                        <pre style="margin-top: 10px; font-size: 12px;">${error.stack}</pre>
+                    </div>
+                </div>
+            `;
+        }
     </script>
 </body>
 </html>

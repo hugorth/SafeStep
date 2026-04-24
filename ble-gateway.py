@@ -22,8 +22,9 @@ from bleak import BleakClient, BleakScanner
 
 # ==================== CONFIG ====================
 DEVICE_NAME    = "SafeStep_Shoe"
-BACKEND_URL    = "http://localhost:3001/api/device/gateway"
-STEP_URL       = "http://localhost:3001/api/device/gateway/step"
+BACKEND_URL       = "http://localhost:3001/api/device/gateway"
+STEP_URL          = "http://localhost:3001/api/device/gateway/step"
+DISCONNECT_URL    = "http://localhost:3001/api/device/gateway/disconnect"
 GATEWAY_KEY    = "safestep-gateway-local"
 DEBOUNCE_MS    = 100   # ms entre deux envois HTTP
 RECONNECT_WAIT = 5     # secondes avant reconnexion
@@ -66,6 +67,21 @@ def notify_step():
                 headers={"X-Gateway-Key": GATEWAY_KEY},
                 timeout=2
             )
+        except Exception:
+            pass
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def notify_disconnect():
+    """Notifie le backend que la gateway se déconnecte de la chaussure."""
+    def _send():
+        try:
+            requests.post(
+                DISCONNECT_URL,
+                headers={"X-Gateway-Key": GATEWAY_KEY},
+                timeout=2
+            )
+            log.info("🔴 Backend notifié de la déconnexion BLE")
         except Exception:
             pass
     threading.Thread(target=_send, daemon=True).start()
@@ -186,7 +202,8 @@ async def connect_and_run():
         log.info(f"✅ Trouvé: {device.name} ({device.address})")
 
         def handle_disconnect(client):
-            log.warning("🔴 Disconnected callback called!")
+            log.warning("🔴 Déconnecté de la chaussure")
+            notify_disconnect()
 
         try:
             async with BleakClient(device.address, disconnected_callback=handle_disconnect) as client:
@@ -203,6 +220,7 @@ async def connect_and_run():
                 while client.is_connected:
                     await asyncio.sleep(1)
 
+                notify_disconnect()
                 log.warning("🔌 Déconnecté — reconnexion dans {}s...".format(RECONNECT_WAIT))
 
         except Exception as e:
@@ -225,4 +243,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(connect_and_run())
     except KeyboardInterrupt:
+        notify_disconnect()
         print("\n👋 Gateway arrêtée.")

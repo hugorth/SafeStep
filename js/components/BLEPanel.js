@@ -4,14 +4,22 @@
 //  - BLE Gateway Python (ble-gateway.py) → données reçues via WebSocket
 
 const BLEPanel = () => {
-    const [bleStatus,   setBleStatus]   = React.useState('disconnected');
-    const [lastData,    setLastData]    = React.useState(null);
-    const [fallAlert,   setFallAlert]   = React.useState(false);
-    const [error,       setError]       = React.useState('');
-    const [gatewayLive, setGatewayLive] = React.useState(false);
+    const [bleStatus,          setBleStatus]          = React.useState('disconnected');
+    const [lastData,           setLastData]           = React.useState(null);
+    const [fallAlert,          setFallAlert]          = React.useState(false);
+    const [backendBleConnected, setBackendBleConnected] = React.useState(false);
+    const [backendBleConnecting, setBackendBleConnecting] = React.useState(false);
     const lastFallTimeRef = React.useRef(0);
 
-    const webBTSupported = BLEManager.isSupported();
+
+    // Récupère l'état BLE initial depuis le backend
+    React.useEffect(() => {
+        SafeStepAPI.getDeviceStatus().then(res => {
+            if (res?.data?.bleConnected) {
+                setBackendBleConnected(true);
+            }
+        }).catch(() => {});
+    }, []);
 
     React.useEffect(() => {
         // --- Mode Web Bluetooth ---
@@ -35,7 +43,6 @@ const BLEPanel = () => {
         // --- Mode Gateway Python — écoute les updates WebSocket ---
         SafeStepAPI.on('device_update', (data) => {
             if (!data) return;
-            setGatewayLive(true);
             setLastData({
                 imu: data.shoe?.sensors?.accelerometer ? {
                     ax: data.shoe.sensors.accelerometer.x,
@@ -59,6 +66,18 @@ const BLEPanel = () => {
             }
         });
 
+        // Chaussure connectée au backend via BLE gateway → arrêt du spinner
+        SafeStepAPI.on('bluetooth_connected', () => {
+            setBackendBleConnected(true);
+            setBackendBleConnecting(false);
+        });
+
+        // Chaussure déconnectée du backend
+        SafeStepAPI.on('bluetooth_disconnected', () => {
+            setBackendBleConnected(false);
+            setBackendBleConnecting(false);
+        });
+
         return () => {
             BLEManager.onStatusChange = null;
             BLEManager.onDataCallback = null;
@@ -66,28 +85,34 @@ const BLEPanel = () => {
         };
     }, []);
 
-    const handleConnect    = async () => {
-        setError('');
-        setBleStatus('connecting');
-        try { await BLEManager.connect(); }
-        catch (e) { setBleStatus('disconnected'); setError(e.message || 'Connexion BLE échouée'); }
+    const handleGatewayConnect = () => {
+        if (!backendBleConnected && !backendBleConnecting) {
+            setBackendBleConnecting(true);
+        }
     };
-    const handleDisconnect = async () => await BLEManager.disconnect();
 
     const imu       = lastData?.imu;
     const gps       = lastData?.gps;
     const vibration = lastData?.vibration;
-    const isLive    = bleStatus === 'connected' || gatewayLive;
+    const isLive    = bleStatus === 'connected' || backendBleConnected;
 
+    // Status Web Bluetooth direct
     const statusColor = bleStatus === 'connected'  ? '#10B981'
                       : bleStatus === 'connecting' ? '#F59E0B'
-                      : gatewayLive                ? '#10B981'
                       : '#EF4444';
 
     const statusLabel = bleStatus === 'connected'  ? 'Connectée (BLE direct)'
                       : bleStatus === 'connecting' ? 'Connexion en cours...'
-                      : gatewayLive                ? 'Connectée (gateway Python)'
                       : 'Déconnectée';
+
+    // Status BLE gateway backend
+    const gatewayColor = backendBleConnected  ? '#10B981'
+                       : backendBleConnecting ? '#F59E0B'
+                       : '#EF4444';
+
+    const gatewayLabel = backendBleConnected  ? 'Backend connecté à la chaussure'
+                       : backendBleConnecting ? 'En attente de connexion...'
+                       : 'Backend non connecté';
 
     return (
         <div className="metric-card mb-6">
@@ -103,14 +128,42 @@ const BLEPanel = () => {
                 Chaussure Connectée
             </h3>
 
-            <div className="flex items-center gap-2 mb-4">
-                <div className="w-2.5 h-2.5 rounded-full" style={{ background: statusColor }}></div>
-                <span className="text-sm font-semibold" style={{ color: statusColor }}>{statusLabel}</span>
-                {isLive && <span className="text-xs text-slate-400 ml-auto">Live ●</span>}
+            {/* --- Section Gateway Backend --- */}
+            <div className="mb-4 p-3 bg-slate-50 rounded-lg">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Gateway BLE (backend)</p>
+                <div className="flex items-center gap-2 mb-3">
+                    <div className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ background: gatewayColor }}></div>
+                    <span className="text-sm font-semibold" style={{ color: gatewayColor }}>{gatewayLabel}</span>
+                    {backendBleConnected && <span className="text-xs text-slate-400 ml-auto">Live ●</span>}
+                </div>
+
+                {!backendBleConnected && (
+                    <button
+                        onClick={handleGatewayConnect}
+                        disabled={backendBleConnecting}
+                        className="w-full py-2.5 rounded-xl font-semibold text-sm text-white transition-all disabled:opacity-70 flex items-center justify-center gap-2"
+                        style={{ background: '#0EA5E9' }}>
+                        {backendBleConnecting ? (
+                            <>
+                                <svg className="animate-spin h-4 w-4 flex-shrink-0" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                                En attente de connexion...
+                            </>
+                        ) : (
+                            <>
+                                <Icon name="bluetooth" size={16} />
+                                Se connecter au Bluetooth
+                            </>
+                        )}
+                    </button>
+                )}
             </div>
 
+            {/* --- Données capteurs en direct --- */}
             {isLive && imu && (
-                <div className="mb-4 p-3 bg-slate-50 rounded-lg text-xs font-mono space-y-2">
+                <div className="p-3 bg-slate-50 rounded-lg text-xs font-mono space-y-2">
                     <div>
                         <span className="font-sans font-semibold text-slate-500">Accéléromètre (g)</span>
                         <div className="flex gap-3 mt-1">
@@ -143,25 +196,6 @@ const BLEPanel = () => {
                     )}
                 </div>
             )}
-
-            {error && <p className="text-xs text-red-500 mb-3">{error}</p>}
-
-            {webBTSupported && (
-                bleStatus !== 'connected' ? (
-                    <button onClick={handleConnect} disabled={bleStatus === 'connecting'}
-                        className="w-full py-3 rounded-xl font-semibold text-sm text-white transition-all disabled:opacity-50 mb-3"
-                        style={{ background: '#0EA5E9' }}>
-                        {bleStatus === 'connecting' ? 'Recherche...' : 'Connecter via Web Bluetooth'}
-                    </button>
-                ) : (
-                    <button onClick={handleDisconnect}
-                        className="w-full py-3 rounded-xl font-semibold text-sm border-2 border-slate-200 text-slate-600 hover:bg-slate-50 transition-all mb-3">
-                        Déconnecter
-                    </button>
-                )
-            )}
-
-
         </div>
     );
 };

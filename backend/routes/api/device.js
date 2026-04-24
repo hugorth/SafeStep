@@ -28,11 +28,14 @@ function generateSimulatedStatus() {
 /**
  * GET /api/device/status
  * Retourne les données réelles si la chaussure est connectée, sinon simulées.
+ * Inclut `bleConnected` pour que le frontend sache si le backend est déjà lié à la chaussure.
  */
 router.get('/status', (req, res) => {
   try {
     const real = deviceService.getData();
-    res.json({ success: true, data: real || generateSimulatedStatus() });
+    const bleConnected = deviceService.isBleConnected();
+    const data = real || generateSimulatedStatus();
+    res.json({ success: true, data: { ...data, bleConnected } });
   } catch (error) {
     console.error('Get device status error:', error);
     res.status(500).json({ success: false, error: 'Failed to get device status' });
@@ -137,8 +140,27 @@ async function gatewayHandler(req, res) {
   }
 }
 
+/**
+ * POST /api/device/gateway/disconnect   (pas de JWT — utilisé par ble-gateway.py)
+ * Notifie le backend que la gateway s'est déconnectée de la chaussure.
+ */
+async function gatewayDisconnectHandler(req, res) {
+  try {
+    const expectedKey = process.env.GATEWAY_API_KEY || 'safestep-gateway-local';
+    if (req.headers['x-gateway-key'] !== expectedKey) {
+      return res.status(401).json({ success: false, error: 'Clé gateway invalide' });
+    }
+    deviceService.setDisconnected();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Gateway disconnect error:', error);
+    res.status(500).json({ success: false });
+  }
+}
+
 module.exports = router;
 module.exports.gatewayHandler = gatewayHandler;
+module.exports.gatewayDisconnectHandler = gatewayDisconnectHandler;
 
 module.exports.gatewayStepHandler = async function(req, res) {
   try {

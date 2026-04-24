@@ -74,6 +74,7 @@ app.use('/api/auth', authRoutes);
 // Gateway BLE (public — protégée par clé API, pas de JWT)
 app.post('/api/device/gateway', require('./routes/api/device').gatewayHandler);
 app.post('/api/device/gateway/step', require('./routes/api/device').gatewayStepHandler);
+app.post('/api/device/gateway/disconnect', require('./routes/api/device').gatewayDisconnectHandler);
 
 // User routes (protected)
 app.use('/api/users', userRoutes);
